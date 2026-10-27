@@ -33,6 +33,15 @@ except Exception as e:  # vosk / sounddevice not installed
 MODES = ['GESTURE', 'VOICE', 'FACE']
 CAMERA_RETRY_SECONDS = 3.0
 
+# After a command fires, the same command is ignored for this many seconds
+# (all modes). Stops PLAYPAUSE / MUTE from re-triggering again and again.
+SLOW_COOLDOWN = 5.0
+# These may repeat quickly (volume sliding, clicking, scrolling, search steps).
+FAST_COMMANDS = {
+    'VOLUP', 'VOLDOWN', 'CLICK', 'SCROLLUP', 'SCROLLDOWN', 'ZOOMIN', 'ZOOMOUT',
+    'LISTENING', 'SEARCH', 'SEARCH_YT',
+}
+
 
 def open_camera():
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # DirectShow opens much faster on Windows
@@ -48,6 +57,7 @@ class TriSense:
         self.last_cmd = '---'
         self.events = queue.Queue()
         self.cam_ok = False
+        self._last_fire = {}  # (command, value) -> time it last ran
 
         self.link = ArduinoLink(
             on_button=lambda: self.events.put('BTN'),
@@ -59,7 +69,7 @@ class TriSense:
         self.voice = None
         if VoiceEngine is not None:
             self.voice = VoiceEngine(
-                on_command=lambda c: self.emit('VOICE', c),
+                on_command=lambda c, a=None: self.emit('VOICE', c, a),
                 on_error=self.error,
             )
             self.voice.enabled = False
@@ -80,14 +90,22 @@ class TriSense:
         print(f'[MAIN] ERR:{reason}', flush=True)
         self.link.send('ERR', reason)
 
-    def emit(self, source, command):
+    def emit(self, source, command, arg=None):
         """Called by the engines. Runs the PC action and tells the Arduino."""
         if source != self.mode:  # ignore engines that are not active
             return
-        print(f'[{source}] {command}', flush=True)
-        if perform(command):
-            self.last_cmd = command
-            self.link.send('CMD', command)
+        now = time.time()
+        key = (command, arg)
+        if command not in FAST_COMMANDS and now - self._last_fire.get(key, 0.0) < SLOW_COOLDOWN:
+            return  # same command too soon: ignore
+        self._last_fire[key] = now
+
+        print(f'[{source}] {command}' + (f' ({arg})' if arg else ''), flush=True)
+        if perform(command, arg):
+            # what the LCD shows: OPEN_SITE + youtube -> OPEN_YOUTUBE (12 chars max)
+            label = f'OPEN_{arg}' if command == 'OPEN_SITE' and arg else command
+            self.last_cmd = label.upper()[:12]
+            self.link.send('CMD', label)
         else:
             self.error('ACTION_FAIL')
 
@@ -116,6 +134,8 @@ class TriSense:
         self.link.start()
         if self.voice:
             self.voice.start()
+        print(f'[MAIN] engines: gesture={"ok" if self.gesture else "FAILED"}  '
+              f'face={"ok" if self.face else "FAILED"}  voice={"ok" if self.voice else "FAILED"}')
         print('[MAIN] looking for the Arduino (up to 5 s)...')
         if self.link.ready.wait(timeout=5.0):
             print('[MAIN] Arduino is ready.')
@@ -136,6 +156,7 @@ class TriSense:
                 except queue.Empty:
                     break
                 if ev == 'BTN':
+                    print('[MAIN] button pressed', flush=True)
                     self.set_mode(self.mode_idx + 1)
                 elif ev == 'READY':  # Arduino (re)booted: tell it where we are
                     self.link.send('MODE', self.mode)
